@@ -1,0 +1,9 @@
+html.se-run .se-wait{visibility:hidden!important}
+.se-reveal{cursor:pointer;position:relative}
+html.se-run .se-reveal:not(.se-open){color:transparent!important;background:repeating-linear-gradient(135deg,#d9d6cc 0 14px,#e6e3da 14px 28px)!important;border-color:transparent!important}
+html.se-run .se-reveal:not(.se-open) *{visibility:hidden}
+html.se-run .se-reveal:not(.se-open)::after{content:attr(data-se-hint);position:absolute;inset:0;display:grid;place-items:center;color:#55524a;font-size:max(18px,.5em);font-weight:600;letter-spacing:.02em;visibility:visible}
+.se-timer{cursor:pointer;font-variant-numeric:tabular-nums;user-select:none}
+.se-timer.se-done{animation:se-blink 1s steps(2,start) infinite}
+@keyframes se-blink{50%{opacity:.25}}
+.se-btn{display:inline-flex;align-items:center;justify-content:center;text-decoration:none;cursor:pointer}

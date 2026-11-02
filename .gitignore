@@ -1,0 +1,9 @@
+.wrangler/
+.taste-skill/
+.impeccable/
+dist/
+node_modules/
+슬라이드편집기.html
+build-check.js
+test/*.html
+test/*.png

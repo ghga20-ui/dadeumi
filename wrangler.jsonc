@@ -1,0 +1,7 @@
+{
+  "$schema": "https://www.unpkg.com/wrangler/config-schema.json",
+  "name": "dadeumi",
+  "compatibility_date": "2026-11-02",
+  "assets": { "directory": "./dist" },
+  "observability": { "enabled": false }
+}
