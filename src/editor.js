@@ -306,6 +306,7 @@ function buildUI(){
         h('button', { class: 'tb', type: 'button', id: 'bZfit', title: '화면에 맞추기' }, '100%'),
         h('button', { class: 'tb ic', type: 'button', id: 'bZin', title: '크게' }, '+')),
       h('div', { id: 'se-note', class: 'hide' }),
+      h('div', { id: 'se-miss', class: 'hide' }),
       h('div', { id: 'se-empty' })
     ),
     h('div', { id: 'se-right' },
@@ -624,6 +625,7 @@ async function closeDeckEditor(){
 
 /* ---------- 문서 불러오기 ---------- */
 async function openText(text, meta){
+  S.hasEngine = /DeckPresenter/.test(text);
   busy('불러오는 중…');
   try {
     const draft = await DB.get('drafts', meta.key);
@@ -679,6 +681,29 @@ function mount(html){
   });
 }
 
+/* 처음엔 투명했다가 클래스가 붙으면 나타나는 요소(.x{opacity:0} + .x.on{opacity:1})는 스크립트를 멈춘 편집 화면에서 안 보인다.
+   편집 전용 스타일로만 보이게 한다. 저장할 때 이 스타일은 빠지므로 발표 순서는 그대로다 */
+function showBuilds(){
+  S.builds = [];
+  const rules = [];
+  const walk = list => { for (const r of list) { if (r.selectorText) rules.push(r); else if (r.cssRules) walk(r.cssRules); } };
+  for (const sh of S.edoc.styleSheets) { if (sh.ownerNode && sh.ownerNode.id === 'se-edit-style') continue; try { walk(sh.cssRules); } catch (e) {} }
+  const sels = r => r.selectorText.split(',').map(x => x.trim());
+  const isCls = x => /^\.[\w-]+$/.test(x);
+  const shows = r => r.style.opacity !== '0' && r.style.visibility !== 'hidden' && (r.style.opacity || r.style.visibility);
+  const found = new Map();
+  for (const r of rules) {
+    if (r.style.opacity !== '0' && r.style.visibility !== 'hidden') continue;
+    for (const a of sels(r)) {
+      if (!/\.[\w-]+$/.test(a) || S.slides.some(x => x.matches(a))) continue;
+      if (rules.some(b => shows(b) && sels(b).some(x => (x.startsWith(a) && isCls(x.slice(a.length))) || (x.endsWith(a) && isCls(x.slice(0, -a.length)))))) found.set(a, r);
+    }
+  }
+  if (!found.size) return;
+  const scope = S.mode === 'slides' ? '[data-se-cur] ' : 'body ';
+  S.builds = [...found].map(([sel, rule]) => ({ sel, rule }));
+  S.edoc.getElementById('se-edit-style').textContent += [...found.keys()].map(a => `${scope}${a}{opacity:1;visibility:visible;transform:none;filter:none;transition:none}`).join(' ');
+}
 async function afterMount(startAt){
   S.ewin = S.ifr.contentWindow; S.edoc = S.ifr.contentDocument;
   const d = S.edoc;
@@ -692,12 +717,14 @@ async function afterMount(startAt){
   d.addEventListener('input', () => { if (S.editing) { setDirty(true); drawOv(); } });
   try { S.ewin.__SE_EDIT = 1; S.ewin.eval(RT_JS); } catch (e) {}
   detectSlides();
+  showBuilds();
   setLoaded(true);
   collectStyles();
   applyShowHidden();
   goto(clamp(startAt, 0, Math.max(0, S.slides.length - 1)));
   if (d.fonts && d.fonts.ready) d.fonts.ready.then(() => { layout(); drawOv(); });
   await resolveRelative();
+  checkAssets();
 }
 
 /* 상대 경로 이미지는 폴더 손잡이로 읽어 보여 주고, 저장할 때 원래 경로로 되돌린다 */
@@ -718,6 +745,44 @@ async function rewriteCssUrls(css, base){
   return css;
 }
 /* 상대 경로 그림·글꼴·CSS는 폴더 손잡이로 읽어 편집 화면에만 보여 주고, 저장할 때 원래대로 둔다 */
+/* 문서가 옆 폴더에서 불러오는 파일 목록 */
+function assetRefs(){
+  const out = new Set(), add = v => { if (isRel(v)) out.add(v); };
+  S.edoc.querySelectorAll('img[src],video[src],source[src],script[src]').forEach(el => add(el.getAttribute('data-se-orig-src') || el.getAttribute('src')));
+  S.edoc.querySelectorAll('link[rel~="stylesheet"][href]').forEach(el => add(el.getAttribute('href')));
+  S.edoc.querySelectorAll('style').forEach(st => { if (!/^se-/.test(st.id)) for (const m of st.textContent.matchAll(/url\(\s*(['"]?)([^'")]+)\1\s*\)/g)) add(m[2]); });
+  return [...out];
+}
+const isFont = v => /\.(ttf|otf|woff2?)([?#]|$)/i.test(v);
+/* 못 불러온 글꼴·그림이 있으면 알린다: 폴더를 모르면 연결 단추, 폴더에 없으면 빠진 파일 이름 */
+async function checkAssets(){
+  const box = $('se-miss'), file = S.file;
+  box.classList.add('hide'); box.innerHTML = '';
+  const refs = assetRefs();
+  const close = h('button', { type: 'button', class: 'ib', title: '닫기', onclick: () => box.classList.add('hide') }, ic('x'));
+  if (!file.dir) {
+    if (!refs.length || !window.showDirectoryPicker) return;
+    const what = refs.every(isFont) ? '글꼴' : refs.some(isFont) ? '글꼴·그림' : '그림';
+    box.append(h('span', { text: `${what} ${refs.length}개는 폴더를 연결해야 보여요` }), h('button', { type: 'button', class: 'btn sm pri', text: '폴더 연결', onclick: connectFolder }), close);
+  } else {
+    const miss = [];
+    for (const r of refs) { if (r.split('/').includes('..')) continue; try { if (!(await readRel(r))) miss.push(r); } catch (e) { miss.push(r); } }
+    if (S.file !== file || !miss.length) return;
+    box.append(h('span', { title: miss.join('\n'), text: `이 폴더에 없는 파일 ${miss.length}개: ${miss.slice(0, 2).map(x => decodeURIComponent(x).split('/').pop()).join(', ')}${miss.length > 2 ? ' 외' : ''}` }), close);
+  }
+  box.classList.remove('hide');
+}
+async function connectFolder(){
+  const f = S.file;
+  try {
+    const dir = await showDirectoryPicker({ ...(f.fh ? { startIn: f.fh } : {}), mode: 'readwrite' });
+    if (f.fh && !(await holds(dir, f.fh))) return toast(`고른 폴더에 ‘${f.name}’이 없어요.`, 'bad');
+    if (f.fh) await DB.set('kv', 'link:' + f.name, dir);
+    f.dir = dir;
+    await resolveRelative();
+    checkAssets();
+  } catch (e) { if (e.name !== 'AbortError') toast('폴더를 연결하지 못했어요: ' + e.message, 'bad'); }
+}
 async function resolveRelative(){
   const dir = S.file && S.file.dir;
   if (!dir) return;
@@ -836,6 +901,7 @@ function rewrapped(pvEl){
   return !!(ed && ed.isConnected && !hiddenInEditor(ed) && normT(ed.textContent).includes(t));
 }
 async function ghostHtml(i, step){
+  if (!S.hasEngine) return null;
   const key = 'g' + i + ':' + (step == null ? 'end' : step);
   if (PV.cache.has(key)) return PV.cache.get(key);
   const ver = PV.ver;
@@ -897,7 +963,7 @@ async function showGhost(i){
   if (S.cur !== i || S.slides[i] !== s || !s.isConnected) return;
   if (r === 'stale') { refreshGhostSoon(); return; }
   s.querySelectorAll(':scope > [data-se-ghost]').forEach(g => g.remove());
-  if (!r) { S.ghost = { i, state: 'fail' }; note(); hiddenCount(null); return; }
+  if (!r) { S.ghost = { i, state: 'fail' }; note(); hiddenCount(0); return; }
   if (r.html) {
     const g = S.edoc.createElement('div'); g.setAttribute('data-se-ghost', isGenerated(s) ? 'all' : ''); g.innerHTML = r.html;
     s.insertBefore(g, s.firstChild);
@@ -929,7 +995,6 @@ function note(){
   if (!on) return;
   /* 겹쳐 보기는 위 막대 ‘숨은 요소 보기’ 단추가 켜져 있는 것으로 충분하다. 띠는 할 일이 있을 때만 */
   if (gen) n.textContent = '발표 때 그려지는 장이에요 · 글자는 오른쪽 ‘이 장의 글자’에서 고쳐요';
-  else if (st === 'fail') n.textContent = '이 덱은 숨은 요소를 읽을 수 없어요';
   else n.classList.add('hide');
 }
 
@@ -968,6 +1033,7 @@ function describe(v){
   return { name, icon, detail: parts.join(' · '), keys, appear };
 }
 async function motionsOf(i){
+  if (!S.hasEngine) return null;
   const key = 'm' + i;
   if (PV.cache.has(key)) return PV.cache.get(key);
   const ver = PV.ver;
@@ -2256,6 +2322,7 @@ function fileMenu(anchor){
     { icon: 'folder', label: '폴더 열기…', fn: () => openFolder() },
     { icon: 'layers', label: '같은 폴더의 다른 파일…', fn: showFileList, disabled: !S.folder },
     '-',
+    { icon: 'file', label: 'PDF로 내보내기…', fn: exportPdf, disabled: !S.edoc },
     { icon: 'restore', label: '백업에서 되살리기…', fn: restoreBackup, disabled: !S.file }
   ]);
 }
@@ -2284,6 +2351,7 @@ function setMenu(anchor){
     })(),
     h('div', { class: 'msep' }),
     h('button', { type: 'button', class: 'mi', onclick: () => { closePop(); restoreBackup(); }, disabled: !S.file || null }, ic('restore'), h('span', { text: '백업에서 되살리기…' })),
+    h('button', { type: 'button', class: 'mi', onclick: () => { closePop(); exportPdf(); }, disabled: !S.edoc || null }, ic('file'), h('span', { text: 'PDF로 내보내기…' })),
     h('button', { type: 'button', class: 'mi', onclick: () => { closePop(); showHelp(); } }, ic('more'), h('span', { text: '단축키 보기' })),
     h('div', { class: 'hint', style: 'padding:6px 10px 4px', text: '다듬이 v' + VERSION }, policyLink())
   );
@@ -3128,17 +3196,19 @@ function addMotion(){
 const hitsSel = (it, els) => it.targets.some(t => t.ed && els.some(e => e === t.ed || e.contains(t.ed)));
 async function fillMotion(box){
   const i = S.cur;
-  const page = S.mode !== 'slides', m = page ? false : await motionsOf(i);
+  const page = S.mode !== 'slides', bs = page || S.hasEngine ? [] : buildEls();
+  const m = page || bs.length ? false : await motionsOf(i);
   if (S.cur !== i || !box.isConnected) return;
   if (m === 'stale') { renderMotionSoon(); return; }
   box.innerHTML = '';
-  const mine = animList(), n = m ? m.n : 0, nDeck = m ? m.items.length : 0;
+  const mine = animList(), n = bs.length || (m ? m.n : 0), nDeck = bs.length || (m ? m.items.length : 0);
   /* 머리: 이 장 요약 */
   const line1 = [n ? `클릭 ${n}번` : '', nDeck + mine.length ? `움직임 ${nDeck + mine.length}개` : ''].filter(Boolean).join(' · ');
   box.appendChild(h('div', { class: 'mhead' },
     h('div', null, h('div', { class: 'mh-t', text: page ? '이 문서의 움직임' : '이 장의 움직임' }),
       line1 ? h('div', { class: 'mh-s' }, h('div', { text: line1 })) : null),
     m && m.items.length ? btn('처음부터', () => playAll(m), { icon: 'play', cls: 'sm pri', title: '이 장의 움직임을 처음부터 끝까지 재생' })
+      : bs.length ? btn('처음부터', () => playBuilds(bs), { icon: 'play', cls: 'sm pri', title: '이 장의 움직임을 처음부터 끝까지 재생' })
       : mine.length ? btn('처음부터', playSlide, { icon: 'play', cls: 'sm pri', title: '이 장의 움직임을 처음부터 끝까지 재생' }) : null));
   /* 고른 요소: 움직임 더하기는 여기서 */
   if (S.sel.length) {
@@ -3157,13 +3227,14 @@ async function fillMotion(box){
   }
   /* 단계마다 묶기: 덱 움직임 → 편집기 움직임은 덱 단계가 끝난 뒤 */
   const groups = new Map();
-  const G = (key, order, title, lb, step) => { if (!groups.has(key)) groups.set(key, { key, order, title, lb, step, deck: [], mine: [] }); return groups.get(key); };
+  const G = (key, order, title, lb, step) => { if (!groups.has(key)) groups.set(key, { key, order, title, lb, step, deck: [], mine: [], build: [] }); return groups.get(key); };
   /* 단계 이름표는 덱 작성자가 한글로 붙인 것만(영문 장면 이름은 감춘다) */
   const lbOf = s => { const l = (m && m.labels[s - 1]) || ''; return /[가-힣]/.test(l) ? l : ''; };
   if (m) for (const it of m.items) {
     const s = it.step;
     (s === 'loop' ? G('loop', 1e6, '계속 반복', '', null) : G('s' + s, s, s === 0 ? '열리자마자' : `클릭 ${s}`, s > 0 ? lbOf(s) : '', s)).deck.push(it);
   }
+  bs.forEach((b, x) => G('s' + (x + 1), x + 1, `클릭 ${x + 1}`, '', null).build.push(b));
   for (const e of mine) {
     if (e.getAttribute('data-se-start') === 'view') G('view', 5e5, '보일 때', '', null).mine.push(e);
     else if (e.getAttribute('data-se-start') === 'click') { const st = n + (+e.getAttribute('data-se-order') || 1); G('s' + st, st, `클릭 ${st}`, '', null).mine.push(e); }
@@ -3175,12 +3246,12 @@ async function fillMotion(box){
   /* 접기: 움직임이 적으면 다 펼치고, 많으면 고른 요소가 든 단계만. 직접 여닫은 단계는 그대로 둔다 */
   if (S.mFoldSlide !== i) { S.mFold = new Map(); S.mFoldSlide = i; }
   const total = nDeck + mine.length;
-  const autoOpen = g => total <= 6 || g.deck.some(it => hitsSel(it, S.sel)) || g.mine.some(e => S.sel.includes(e));
+  const autoOpen = g => total <= 6 || g.deck.some(it => hitsSel(it, S.sel)) || g.mine.some(e => S.sel.includes(e)) || g.build.some(b => S.sel.includes(b.el));
   for (const g of list) {
     const open = S.mFold.has(g.key) ? S.mFold.get(g.key) : autoOpen(g);
-    const cnt = g.deck.length + g.mine.length;
+    const cnt = g.deck.length + g.mine.length + g.build.length;
     /* 단계 재생: 덱 움직임은 몰래 띄운 덱으로, 편집기 움직임만 있는 단계는 편집 화면에서 */
-    const play = g.deck.length ? () => playStep(m, g.order === 1e6 ? 'loop' : g.step) : () => g.mine.forEach(e => playOne(e));
+    const play = g.deck.length ? () => playStep(m, g.order === 1e6 ? 'loop' : g.step) : () => { g.build.forEach(playBuild); g.mine.forEach(e => playOne(e)); };
     const head = h('div', { class: 'mg-h', role: 'button', tabindex: '0', 'aria-expanded': String(open) },
       h('span', { class: 'chev' }, ic(open ? 'chevd' : 'chev')),
       h('span', { class: 'mstep-n' + (g.order === 1e6 ? ' loop' : g.order === 0 ? ' start' : ''), text: g.order === 1e6 ? '↻' : g.order === 0 ? '시작' : g.order === 5e5 ? '↓' : String(g.order) }),
@@ -3189,10 +3260,11 @@ async function fillMotion(box){
     const toggle = () => { S.mFold.set(g.key, !open); fillMotion(box); };
     head.onclick = toggle;
     head.onkeydown = ev => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); toggle(); } };
-    head.onmouseenter = () => { S.mhl = [...g.deck.flatMap(it => it.targets.map(t => t.status === 'ok' && t.ed ? { ...boxOf(t.ed) } : { ...t.box, script: true })), ...g.mine.map(e => boxOf(e))]; drawOv(); };
+    head.onmouseenter = () => { S.mhl = [...g.deck.flatMap(it => it.targets.map(t => t.status === 'ok' && t.ed ? { ...boxOf(t.ed) } : { ...t.box, script: true })), ...g.mine.map(e => boxOf(e)), ...g.build.map(b => boxOf(b.el))]; drawOv(); };
     head.onmouseleave = () => { S.mhl = null; drawOv(); };
     const grp = h('div', { class: 'mgrp' + (open ? ' open' : '') }, head);
     if (open) {
+      g.build.forEach(b => grp.appendChild(buildRow(b)));
       g.deck.forEach(it => { grp.appendChild(motionRow(it, m)); if (it.canEdit && !it.loop && S.openMo === moKey(it)) grp.appendChild(deckEditor(it, m)); });
       g.mine.forEach(e => { grp.appendChild(mineRow(e)); if (S.openAnim === e && S.sel.includes(e)) grp.appendChild(animEditor(e, m && m.items.some(it => hitsSel(it, [e])))); });
     }
@@ -3298,6 +3370,41 @@ function previewMo(it, wait = 0){
     const now = m.items.find(x => moKey(x) === key);
     if (now) playItem(m, now);
   }, wait);
+}
+/* 스크립트 없이 클래스로 나타나는 요소: 파일 순서대로 한 클릭씩으로 본다 */
+function buildEls(){
+  const list = S.builds || [];
+  if (!list.length) return [];
+  return [...S.box.querySelectorAll(list.map(x => x.sel).join(','))].filter(e => !e.closest('[data-se-ghost]')).map(el => ({ el, rule: list.find(x => el.matches(x.sel)).rule }));
+}
+function buildInfo(rule){
+  const t = rule.style.transform || '', num = re => { const x = t.match(re); return x ? parseFloat(x[1]) : 0; };
+  const y = num(/translateY\((-?[\d.]+)/), x = num(/translateX\((-?[\d.]+)/);
+  const name = y > 0 ? '위로 떠오르며 나타나기' : y < 0 ? '아래로 내려오며 나타나기' : x > 0 ? '왼쪽으로 들어오며 나타나기' : x < 0 ? '오른쪽으로 들어오며 나타나기' : /scale/.test(t) ? '커지며 나타나기' : '나타나기';
+  return { name, dur: parseFloat(rule.style.transitionDuration) || 0.4 };
+}
+function playBuild(b){
+  const s = b.rule.style;
+  b.el.animate([{ opacity: 0, transform: s.transform || 'none', filter: s.filter || 'none' }, { opacity: 1, transform: 'none', filter: 'none' }], { duration: buildInfo(b.rule).dur * 1000, easing: 'ease' });
+}
+async function playBuilds(list){
+  list.forEach(b => { b.el.style.visibility = 'hidden'; });
+  for (const b of list) { b.el.style.visibility = ''; playBuild(b); await sleep(buildInfo(b.rule).dur * 1000 + 350); }
+  list.forEach(b => { if (!b.el.getAttribute('style')) b.el.removeAttribute('style'); });
+}
+function buildRow(b){
+  const inf = buildInfo(b.rule), e = b.el;
+  const r = h('div', { class: 'mrow' + (S.sel.includes(e) ? ' on' : '') },
+    ic('spark'),
+    h('div', { class: 'mt' },
+      h('div', { class: 'mn' }, h('span', { text: inf.name }), h('span', { class: 'lock', title: '이 움직임은 바꿀 수 없어요' }, ic('lock'))),
+      h('div', { class: 'mg', text: nameOf(e, 16) }),
+      h('div', { class: 'mtime', text: `${rnd(inf.dur, 2)}초 동안` })),
+    h('button', { type: 'button', class: 'ib rowplay', title: '이 움직임 재생', onclick: ev => { ev.stopPropagation(); playBuild(b); } }, ic('play')));
+  r.onmouseenter = () => { S.mhl = [boxOf(e)]; drawOv(); };
+  r.onmouseleave = () => { S.mhl = null; drawOv(); };
+  r.onclick = () => select([e]);
+  return r;
 }
 function mineRow(e){
   const start = e.getAttribute('data-se-start'), click = start === 'click', open = S.openAnim === e && S.sel.includes(e);
@@ -3596,6 +3703,75 @@ async function restoreBackup(){
   modal({ title: '백업에서 되살리기', body: h('div', null, h('p', { text: `‘${S.file.name}’의 이전 판입니다. 고르면 편집기로 불러와요(아직 저장되지는 않아요).` }), list), ok: null, cancel: '닫기' });
 }
 
+/* PDF: 장마다 다 나타난 모습을 한 쪽씩 깐 인쇄용 문서를 만들어 브라우저 인쇄 창을 연다 */
+async function pdfSlide(i, w){
+  const src = S.slides[i];
+  if (!w) return src.cloneNode(true);
+  PV.moved++;
+  try { w.__seDeck.go(i, null); } catch (e) { return src.cloneNode(true); }
+  await sleep(40);
+  const s = findSlides(w.document)[i]; if (!s) return src.cloneNode(true);
+  const c = s.cloneNode(true);
+  /* 캔버스는 그림으로, 상대 경로 그림은 편집 화면의 주소로 */
+  const A = [...s.querySelectorAll('canvas')], B = [...c.querySelectorAll('canvas')];
+  B.forEach((x, n) => { try { const m = w.document.createElement('img'); m.src = A[n].toDataURL(); m.style.cssText = x.style.cssText; m.className = x.className; x.replaceWith(m); } catch (e) {} });
+  c.querySelectorAll('img[data-se-k]').forEach(m => { const ed = S.pvMap[m.getAttribute('data-se-k')]; if (ed && ed.currentSrc) m.src = ed.currentSrc; });
+  return c;
+}
+async function pdfHtml(){
+  const doc = S.edoc.documentElement.cloneNode(true);
+  doc.removeAttribute('data-se-edit'); doc.removeAttribute('data-se-showhidden');
+  const body = doc.querySelector('body');
+  const clean = n => n.querySelectorAll('script,[data-se-ghost]').forEach(x => x.remove());
+  let css = `*{-webkit-print-color-adjust:exact;print-color-adjust:exact;transition:none!important;animation-duration:0s!important;animation-delay:0s!important}`;
+  if (S.mode === 'page') { clean(doc); css += '@page{margin:12mm}'; }
+  else {
+    const cur = S.slides[S.cur], W = cur.offsetWidth, H = cur.offsetHeight, disp = cs(cur).display, bg = S.ewin.getComputedStyle(S.edoc.body).backgroundColor;
+    const pv = S.hasEngine && await pvLoad() ? PV.f.contentWindow : null;
+    body.innerHTML = '';
+    for (let i = 0; i < S.slides.length; i++) {
+      const src = S.slides[i];
+      if (src.hasAttribute('data-se-skip')) continue;
+      const c = S.edoc.importNode(await pdfSlide(i, pv), true);
+      clean(c);
+      c.removeAttribute('data-se-off'); c.setAttribute('data-se-cur', '');
+      if (S.activeCls) c.classList.add(S.activeCls);
+      c.style.cssText += `;position:absolute;left:0;top:0;width:${W}px;height:${H}px;margin:0;display:${disp};opacity:1;visibility:visible;transform:none;translate:none`;
+      /* 덱 CSS의 '#stage .slide' 같은 규칙이 맞도록 바깥 겹을 비운 채 되살린다 */
+      let node = c;
+      for (let p = src.parentElement; p && p !== S.edoc.body; p = p.parentElement) {
+        const o = p.cloneNode(false);
+        ['data-se-anc', 'data-se-off'].forEach(a => o.removeAttribute(a));
+        o.style.cssText += ';position:static;transform:none;width:auto;height:auto;margin:0;padding:0;display:block;overflow:visible';
+        o.appendChild(node); node = o;
+      }
+      const page = S.edoc.createElement('div'); page.className = 'se-page'; page.style.background = bg; page.appendChild(node);
+      body.appendChild(page);
+    }
+    css += `@page{size:${W}px ${H}px;margin:0}html,body{margin:0!important;padding:0!important;width:auto!important;height:auto!important;overflow:visible!important;display:block!important;background:none!important;transform:none!important}.se-page{position:relative;width:${W}px;height:${H}px;overflow:hidden;break-after:page;break-inside:avoid}.se-page:last-child{break-after:auto}`;
+  }
+  const st = S.edoc.createElement('style'); st.textContent = css;
+  doc.querySelector('head').appendChild(st);
+  const t = doc.querySelector('title'); if (t) t.textContent = S.file.name.replace(/\.html?$/i, '');
+  return '<!DOCTYPE html>\n' + doc.outerHTML;
+}
+async function exportPdf(){
+  if (!S.edoc || !S.file) return;
+  endEdit(); settle(); if (PL.on) pvHide();
+  busy('PDF로 만들 쪽을 준비하는 중…');
+  try {
+    const html = await pdfHtml();
+    const f = h('iframe', { 'aria-hidden': 'true', tabindex: '-1', style: 'position:fixed;left:-99999px;top:0;width:1920px;height:1080px;border:0' });
+    document.body.appendChild(f);
+    await new Promise(r => { f.onload = r; f.srcdoc = html; });
+    try { await f.contentDocument.fonts.ready; } catch (e) {}
+    await sleep(300);
+    busy(false);
+    f.contentWindow.addEventListener('afterprint', () => f.remove());
+    f.contentWindow.print();
+  } catch (e) { busy(false); console.error(e); toast('PDF를 만들지 못했어요: ' + e.message, 'bad'); }
+}
+
 function preview(){
   if (!S.edoc) return;
   const html = serialize({ preview: true });
@@ -3651,5 +3827,5 @@ function onKey(e){
    =================================================================== */
 buildUI();
 renderWelcome();
-window.__SE = { S, motionsOf, openText, openFileHandle, openFolder, save, restoreBackup, serialize, goto, select, insertText, insertShape, setAnim, change, undo, redo, startEdit, endEdit, textStyle, layout, drawOv, renderPanel, wrapSel };
+window.__SE = { S, checkAssets, pdfHtml, motionsOf, openText, openFileHandle, openFolder, save, restoreBackup, serialize, goto, select, insertText, insertShape, setAnim, change, undo, redo, startEdit, endEdit, textStyle, layout, drawOv, renderPanel, wrapSel };
 })();

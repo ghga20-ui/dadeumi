@@ -363,6 +363,9 @@ textarea.f{height:auto;padding:8px 10px;resize:vertical;font:var(--t3)/1.5 Conso
 .mrow .rowplay svg.i{width:13px;height:13px;fill:currentColor}
 .mrow .rowplay:hover{background:var(--ac);color:var(--ac-ink)}
 .mrow .mn .lock{margin:0}
+#se-miss{position:absolute;left:50%;bottom:16px;transform:translateX(-50%);z-index:5;display:flex;align-items:center;gap:8px;max-width:calc(100% - 32px);padding:6px 6px 6px 14px;border-radius:var(--r);background:var(--warn-bg);color:var(--ink);font-size:var(--t3);white-space:nowrap}
+#se-miss.hide{display:none}
+#se-miss span{overflow:hidden;text-overflow:ellipsis}
 #se-play{position:absolute;left:50%;top:12px;transform:translateX(-50%);z-index:46;display:flex;align-items:center;gap:8px;padding:5px 6px 5px 12px;border-radius:var(--r);background:var(--c-play);color:var(--c-play-ink);font-size:var(--t3);font-weight:600;box-shadow:var(--float);white-space:nowrap}
 #se-play>svg.i{width:13px;height:13px;fill:currentColor}
 #se-play .ib{width:28px;height:28px;color:inherit}
