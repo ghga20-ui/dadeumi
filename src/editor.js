@@ -262,6 +262,29 @@ async function perm(handle, write){
   } catch (e) { return false; }
 }
 
+/* 내용 지문(길이 + FNV-1a): 바깥에서 파일이 바뀌었는지, 임시 저장본이 지금 원본에서 나왔는지 가린다 */
+function digest(s){
+  let x = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) { x ^= s.charCodeAt(i); x = Math.imul(x, 16777619); }
+  return s.length + ':' + (x >>> 0).toString(36);
+}
+/* 파일마다 고유한 열쇠. 이름이 같아도 다른 파일이면 백업·임시 저장본을 따로 둔다(isSameEntry로 같은 파일인지 가림) */
+async function fileKey(fh){
+  const list = (await DB.get('kv', 'fileids')) || [];
+  for (let i = 0; i < list.length; i++) {
+    const it = list[i];
+    if (it.h.name !== fh.name) continue;
+    let same = false; try { same = await it.h.isSameEntry(fh); } catch (e) {}
+    if (!same) continue;
+    if (i > 0) { list.splice(i, 1); list.unshift(it); await DB.set('kv', 'fileids', list); }
+    return it.id;
+  }
+  const id = 'fh:' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+  list.unshift({ h: fh, id });
+  await DB.set('kv', 'fileids', list.slice(0, 500));
+  return id;
+}
+
 /* ===================================================================
    화면 만들기
    =================================================================== */
@@ -476,8 +499,13 @@ async function renderRecent(){
       ic(r.kind === 'dir' ? 'folder' : 'file'), h('span', { text: r.label || r.name }), h('small', { text: when(r.time) })))));
 }
 async function addRecent(item){
-  let list = (await DB.get('kv', 'recent')) || [];
-  list = list.filter(r => !(r.kind === item.kind && r.label === item.label));
+  const old = (await DB.get('kv', 'recent')) || [], list = [];
+  for (const r of old) {
+    let same = r.kind === item.kind && r.label === item.label;
+    /* 이름만 같은 다른 파일·폴더는 따로 남긴다 */
+    if (same && r.handle && item.handle) { try { same = await r.handle.isSameEntry(item.handle); } catch (e) {} }
+    if (!same) list.push(r);
+  }
   list.unshift({ ...item, time: Date.now() });
   await DB.set('kv', 'recent', list.slice(0, 8));
 }
@@ -536,7 +564,7 @@ function showFileList(){
 async function openEntry(f){
   if (!(await confirmDiscard())) return;
   const file = await f.h.getFile();
-  openText(await file.text(), { name: f.name, key: S.folder.handle.name + '/' + f.path, fh: f.h, dir: f.dir, label: f.path, mtime: file.lastModified });
+  openText(await file.text(), { name: f.name, key: await fileKey(f.h), legacyKey: S.folder.handle.name + '/' + f.path, fh: f.h, dir: f.dir, label: f.path, mtime: file.lastModified });
 }
 
 async function openSingle(){
@@ -554,7 +582,7 @@ async function openFileHandle(fh){
   await perm(fh, true);
   const file = await fh.getFile();
   await addRecent({ kind: 'file', name: fh.name, label: fh.name, handle: fh });
-  openText(await file.text(), { name: fh.name, key: 'file:' + fh.name, fh, dir, label: fh.name, mtime: file.lastModified });
+  openText(await file.text(), { name: fh.name, key: await fileKey(fh), legacyKey: 'file:' + fh.name, fh, dir, label: fh.name, mtime: file.lastModified });
 }
 /* 파일이 이 폴더 바로 아래에 있는가 */
 const holds = async (dir, fh) => { try { const p = await dir.resolve(fh); return !!p && p.length === 1; } catch (e) { return false; } };
@@ -604,7 +632,7 @@ async function renderDeckWelcome(box){
       catch (e) { return toast(`고른 폴더에 ‘${BOOT.fileName}’이 없어요. 이 덱이 들어 있는 폴더를 골라 주세요.`, 'bad'); }
       await DB.set('kv', 'dir:' + BOOT.dirKey, dir);
       const file = await fh.getFile();
-      await openText(await file.text(), { name: BOOT.fileName, key: BOOT.dirKey + BOOT.fileName, fh, dir, label: BOOT.fileName, mtime: file.lastModified, startAt: BOOT.cur });
+      await openText(await file.text(), { name: BOOT.fileName, key: await fileKey(fh), legacyKey: BOOT.dirKey + BOOT.fileName, fh, dir, label: BOOT.fileName, mtime: file.lastModified, startAt: BOOT.cur });
     } catch (e) { if (e.name !== 'AbortError') toast('열지 못했어요: ' + e.message, 'bad'); }
   };
   box.appendChild(h('div', { class: 'welcome' },
@@ -628,13 +656,19 @@ async function openText(text, meta){
   S.hasEngine = /DeckPresenter/.test(text);
   busy('불러오는 중…');
   try {
-    const draft = await DB.get('drafts', meta.key);
-    if (draft && draft.html && (!meta.mtime || draft.time > meta.mtime) && draft.base === text.length) {
+    /* 디스크에 있는 원본의 지문. 백업에서 되살릴 때는 넘겨받은 값을 그대로 쓴다 */
+    const disk = digest(text);
+    if (meta.diskHash == null) meta.diskHash = disk;
+    /* 임시 저장본은 같은 원본에서 나온 것만 이어 쓴다(지문 비교). 예전 판이 남긴 것(base가 글자 수)은 예전 규칙대로 */
+    const fits = d => d && d.html && (typeof d.base === 'number' ? d.base === text.length && (!meta.mtime || d.time > meta.mtime) : d.base === disk);
+    let dkey = meta.key, draft = await DB.get('drafts', dkey);
+    if (!fits(draft) && meta.legacyKey) { const d = await DB.get('drafts', meta.legacyKey); if (fits(d)) { draft = d; dkey = meta.legacyKey; } }
+    if (fits(draft)) {
       busy(false);
       const use = await modal({ title: '저장하지 않은 편집본이 있어요', body: `${when(draft.time)}에 편집하다 저장하지 않은 내용이 남아 있어요. 이어서 할까요?`, ok: '이어서 하기', cancel: '원본 열기' });
       busy('불러오는 중…');
-      if (use) { meta.fromDraft = true; meta.base = text; text = draft.html; }
-      else await DB.del('drafts', meta.key);
+      if (use) { meta.fromDraft = true; text = draft.html; if (dkey !== meta.key) await DB.set('drafts', meta.key, { ...draft, base: disk }); }
+      if (!use || dkey !== meta.key) await DB.del('drafts', dkey);
     }
     const pdoc = new DOMParser().parseFromString(text, 'text/html');
     S.embed = !!pdoc.getElementById('slide-editor');
@@ -642,8 +676,8 @@ async function openText(text, meta){
     prepareDoc(pdoc);
     setLoaded(true);
     await mount('<!DOCTYPE html>\n' + pdoc.documentElement.outerHTML);
-    S.file = meta; S.file.baseLen = meta.base ? meta.base.length : text.length;
-    S.hist = []; S.fut = []; S.sel = []; S.editing = null; S.live = null; S.saved = S.saved || false;
+    S.file = meta;
+    S.hist = []; S.fut = []; bigReset(); S.sel = []; S.editing = null; S.live = null; S.saved = S.saved || false;
     afterMount(meta.startAt || 0);
     setDirty(!!meta.fromDraft);
     $('se-fname').firstChild.textContent = meta.label || meta.name;
@@ -1949,22 +1983,32 @@ function selPaths(){
 function fromPaths(paths){
   return (paths || []).map(p => { let n = S.box; for (const i of p) { n = n && kidsOf(n)[i]; } return n; }).filter(n => n && n !== S.box);
 }
+/* 되돌리기 기록에는 큰 data: 주소(덱에 넣은 그림·글꼴)를 통째로 담지 않는다.
+   한 번만 BIG에 들고 기록에는 짧은 표식(se-big:번호;)만 남긴다. 20MB 덱을 80번 찍어도 그림은 한 벌뿐이다 */
+const BIG = { ids: new Map(), vals: [] };
+const BIG_RE = /data:[\w.+-]+\/[\w.+-]+(?:;[\w.+-]+=[^;,"'&)\s]*)*;base64,[A-Za-z0-9+/=]{2048,}/g;
+function bigReset(){ BIG.ids = new Map(); BIG.vals = []; }
+function pack(s){
+  if (s == null) return s;
+  return s.replace(BIG_RE, m => { let i = BIG.ids.get(m); if (i == null) { i = BIG.vals.push(m) - 1; BIG.ids.set(m, i); } return 'se-big:' + i + ';'; });
+}
+function unpack(s){ return s == null ? s : s.replace(/se-big:(\d+);/g, (m, i) => BIG.vals[i] != null ? BIG.vals[i] : m); }
 function snap(scope){
   if (scope && typeof scope === 'object') { const sc = S.edoc.querySelectorAll('script')[scope.script]; return { scope: 'script', si: scope.script, text: sc.textContent, idx: S.cur }; }
   if (scope === 'slide' && S.mode === 'page') scope = 'all';
   return withoutGhosts(() => {
-    if (scope === 'slide') return { scope, idx: S.cur, html: S.slides[S.cur].outerHTML, sel: selPaths() };
-    if (scope === 'head') { const st = S.edoc.getElementById('se-fonts'); return { scope, css: st ? st.textContent : null, idx: S.cur }; }
-    return { scope: 'all', html: S.edoc.body.innerHTML, idx: S.cur, sel: selPaths() };
+    if (scope === 'slide') return { scope, idx: S.cur, html: pack(S.slides[S.cur].outerHTML), sel: selPaths() };
+    if (scope === 'head') { const st = S.edoc.getElementById('se-fonts'); return { scope, css: st ? pack(st.textContent) : null, idx: S.cur }; }
+    return { scope: 'all', html: pack(S.edoc.body.innerHTML), idx: S.cur, sel: selPaths() };
   });
 }
 function snapAgain(sn){ return snap(sn.scope === 'script' ? { script: sn.si } : sn.scope); }
 function snapChanged(sn){
   if (sn.scope === 'script') return S.edoc.querySelectorAll('script')[sn.si].textContent !== sn.text;
   return withoutGhosts(() => {
-    if (sn.scope === 'slide') return S.slides[sn.idx] && S.slides[sn.idx].outerHTML !== sn.html;
-    if (sn.scope === 'head') { const st = S.edoc.getElementById('se-fonts'); return (st ? st.textContent : null) !== sn.css; }
-    return S.edoc.body.innerHTML !== sn.html;
+    if (sn.scope === 'slide') return S.slides[sn.idx] && pack(S.slides[sn.idx].outerHTML) !== sn.html;
+    if (sn.scope === 'head') { const st = S.edoc.getElementById('se-fonts'); return (st ? pack(st.textContent) : null) !== sn.css; }
+    return pack(S.edoc.body.innerHTML) !== sn.html;
   });
 }
 function restore(sn){
@@ -1975,17 +2019,17 @@ function restore(sn){
     goto(sn.idx, true);
   } else if (sn.scope === 'slide') {
     const old = S.slides[sn.idx]; if (!old) return;
-    const t = S.edoc.createElement('template'); t.innerHTML = sn.html;
+    const t = S.edoc.createElement('template'); t.innerHTML = unpack(sn.html);
     old.replaceWith(t.content.firstElementChild);
     refreshSlides(); goto(sn.idx, true);
     S.sel = fromPaths(sn.sel);
   } else if (sn.scope === 'head') {
     let st = S.edoc.getElementById('se-fonts');
     if (sn.css == null) { if (st) st.remove(); }
-    else { if (!st) { st = S.edoc.createElement('style'); st.id = 'se-fonts'; S.edoc.head.appendChild(st); } st.textContent = sn.css; }
+    else { if (!st) { st = S.edoc.createElement('style'); st.id = 'se-fonts'; S.edoc.head.appendChild(st); } st.textContent = unpack(sn.css); }
     collectStyles();
   } else {
-    S.edoc.body.innerHTML = sn.html;
+    S.edoc.body.innerHTML = unpack(sn.html);
     refreshSlides(); goto(Math.min(sn.idx, Math.max(0, S.slides.length - 1)), true);
     S.sel = fromPaths(sn.sel);
   }
@@ -3638,12 +3682,19 @@ async function saveNow(){
   if (!S.file.fh) { download(html, S.file.name); setDirty(false); DB.del('drafts', S.file.key); return; }
   try {
     if (!(await perm(S.file.fh, true))) throw new Error('파일에 쓸 권한이 없어요');
-    const old = await (await S.file.fh.getFile()).text();
+    const cur = await S.file.fh.getFile();
+    const old = await cur.text();
+    /* 연 뒤에 다른 프로그램(다른 탭, 코드 편집기 등)이 파일을 고쳤으면 덮어쓰기 전에 묻는다 */
+    if (old !== html && S.file.diskHash && digest(old) !== S.file.diskHash) {
+      const go = await modal({ title: '파일이 바깥에서 바뀌었어요', danger: true, ok: '그래도 덮어쓰기', cancel: '저장 안 함',
+        body: `‘${S.file.name}’을 연 뒤 다른 곳에서 이 파일을 고쳤어요(${when(cur.lastModified)}). 덮어쓰면 그 변경은 원본에서 사라지고 백업에만 남아요.` });
+      if (!go) return toast('저장하지 않았어요. 바깥에서 고친 내용을 보려면 파일을 다시 열어 주세요.');
+    }
     let where = null;
     if (old !== html) { await linkFolder(); where = await backup(old); }
     const w = await S.file.fh.createWritable(); await w.write(html); await w.close();
     setDirty(false); S.saved = true; DB.del('drafts', S.file.key);
-    S.file.baseLen = html.length;
+    S.file.diskHash = digest(html);
     toast('저장했어요' + (where ? ` · 이전 판은 ${where}` : ''), 'ok');
   } catch (e) { console.error(e); toast('저장하지 못했어요: ' + e.message, 'bad'); }
 }
@@ -3670,10 +3721,19 @@ function download(html, name){
   document.body.appendChild(a); a.click(); a.remove();
   toast('내려받기로 저장했어요. 원본 자리에 덮어써 주세요.');
 }
-const saveDraftSoon = debounce(async () => {
-  if (!S.dirty || !S.file || !S.edoc || S.editing) return;
-  try { await DB.set('drafts', S.file.key, { html: serialize(), time: Date.now(), base: S.file.baseLen }); } catch (e) {}
-}, 4000);
+/* 임시 저장: 문서 전체를 직렬화하므로, 오래 걸리는 큰 덱일수록 간격을 늘린다(최소 4초) */
+let draftCost = 0, draftT = 0;
+function saveDraftSoon(){
+  clearTimeout(draftT);
+  draftT = setTimeout(async () => {
+    if (!S.dirty || !S.file || !S.edoc || S.editing) return;
+    try {
+      const t0 = performance.now(), html = serialize({ quiet: true });
+      draftCost = performance.now() - t0;
+      await DB.set('drafts', S.file.key, { html, time: Date.now(), base: S.file.diskHash });
+    } catch (e) {}
+  }, Math.max(4000, draftCost * 30));
+}
 
 async function restoreBackup(){
   if (!S.file) return;
@@ -3687,19 +3747,23 @@ async function restoreBackup(){
       }
     } catch (e) {}
   }
-  (await DB.entries('backups')).forEach(([, v]) => { if (v.key === S.file.key) items.push({ name: v.name, time: v.time, size: v.text.length, get: async () => v.text }); });
+  (await DB.entries('backups')).forEach(([, v]) => {
+    if (v.key === S.file.key) items.push({ name: v.name, time: v.time, size: v.text.length, get: async () => v.text });
+    /* 파일별 열쇠를 쓰기 전에 이름으로만 보관한 것: 이름이 같은 다른 파일의 판일 수도 있다 */
+    else if (S.file.legacyKey && v.key === S.file.legacyKey) items.push({ name: v.name, time: v.time, size: v.text.length, legacy: true, get: async () => v.text });
+  });
   items.sort((a, b) => b.time - a.time);
   const list = h('div', { class: 'filelist' });
   if (!items.length) list.appendChild(h('div', { class: 'empty-note', text: '아직 백업이 없어요. 저장할 때마다 이전 판이 쌓여요.' }));
   items.forEach(it => list.appendChild(h('button', { type: 'button', onclick: async () => {
     document.querySelector('.modal-bg').remove();
     const text = await it.get();
-    const meta = { ...S.file, fromDraft: false };
+    const meta = { ...S.file, fromDraft: false };   /* diskHash는 그대로: 디스크의 원본은 바뀌지 않았다 */
     await DB.del('drafts', S.file.key);
     await openText(text, meta);
     setDirty(true);
     toast('백업을 불러왔어요. 저장하면 원본이 이 판으로 바뀝니다(지금 판은 다시 백업돼요).');
-  } }, ic('restore'), h('span', { text: when(it.time) }), h('small', { text: kb(it.size) }))));
+  } }, ic('restore'), h('span', { text: when(it.time) + (it.legacy ? ' · 예전 보관본(이름이 같은 다른 파일일 수 있음)' : '') }), h('small', { text: kb(it.size) }))));
   modal({ title: '백업에서 되살리기', body: h('div', null, h('p', { text: `‘${S.file.name}’의 이전 판입니다. 고르면 편집기로 불러와요(아직 저장되지는 않아요).` }), list), ok: null, cancel: '닫기' });
 }
 
